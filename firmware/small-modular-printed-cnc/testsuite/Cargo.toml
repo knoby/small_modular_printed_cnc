@@ -1,0 +1,34 @@
+[package]
+authors = ["knoby <maximilian.brinkmann@posteo.de>"]
+edition = "2018"
+name = "testsuite"
+publish = false
+version = "0.1.0"
+
+[[test]]
+harness = false
+name = "test"
+
+[dependencies]
+cortex-m = "0.7.1"
+cortex-m-rt = "0.6.12"
+defmt = "0.2.0"
+defmt-rtt = "0.2.0"
+defmt-test = "0.2.0"
+panic-probe = {version = "0.2.0", features = ["print-defmt"]}
+small-modular-printed-cnc = {path = ".."}
+
+[features]
+# set logging levels here
+default = [
+  # in tests, enable all logs
+  "defmt-trace", # "dependency-a/defmt-trace",
+]
+
+# do NOT modify these features
+defmt-debug = []
+defmt-default = []
+defmt-error = []
+defmt-info = []
+defmt-trace = []
+defmt-warn = []
