@@ -10,6 +10,8 @@ cortex-m-rt = "0.6.13"
 cortex-m-rtic = {git = "https://github.com/rtic-rs/cortex-m-rtic", rev = "cfd0c6ca2683cabbda8e890c03eb978ab3924f1d"}
 defmt = "0.2.0"
 defmt-rtt = "0.2.0"
+dwt-systick-monotonic = "0.1.0-alpha.1"
+embedded-hal = "0.2.5"
 gcode = {version = "0.6.1", default-features = false}
 heapless = "0.7.0"
 nb = "1.0.0"

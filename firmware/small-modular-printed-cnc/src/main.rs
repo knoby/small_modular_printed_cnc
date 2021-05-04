@@ -12,12 +12,16 @@ mod arduino_shield;
 mod hw_config;
 mod misc;
 
-#[app(device = stm32f1xx_hal::device)]
+#[app(device = stm32f1xx_hal::device, dispatchers = [SPI1, SPI2])]
 mod app {
 
     use defmt::debug;
+    use dwt_systick_monotonic::DwtSystick;
+    use rtic::rtic_monotonic::{Microseconds, Seconds};
     use stm32f1xx_hal::{prelude::_stm32_hal_flash_FlashExt, rcc::RccExt};
     use stm32f1xx_hal::{prelude::*, serial::Config};
+
+    use crate::hw_config;
 
     #[resources]
     struct Resources {
@@ -29,10 +33,14 @@ mod app {
         buffer_queue_in: heapless::spsc::Producer<'static, ([u8; 64], usize), 4>,
         #[task_local]
         buffer_queue_out: heapless::spsc::Consumer<'static, ([u8; 64], usize), 4>,
+        stepper_pins: crate::hw_config::stepper::StepperPins,
     }
 
+    #[monotonic(binds = SysTick, default = true)]
+    type MyMono = DwtSystick<64_000_000>; // 64 MHz
+
     #[init]
-    fn init(cx: init::Context) -> (init::LateResources, init::Monotonics) {
+    fn init(mut cx: init::Context) -> (init::LateResources, init::Monotonics) {
         static mut SERIAL_QUEUE: heapless::spsc::Queue<([u8; 64], usize), 4> =
             heapless::spsc::Queue::new();
         let (buffer_queue_in, buffer_queue_out) = SERIAL_QUEUE.split();
@@ -44,11 +52,21 @@ mod app {
         let mut flash = device.FLASH.constrain();
         let mut afio = device.AFIO.constrain(&mut rcc.apb2);
 
-        let clocks = rcc.cfgr.freeze(&mut flash.acr);
+        let clocks = rcc
+            .cfgr
+            .sysclk(64.mhz())
+            .pclk1(32.mhz())
+            .pclk2(64.mhz())
+            .freeze(&mut flash.acr);
+
+        // Activate GPIOs
+        let mut gpioa = device.GPIOA.split(&mut rcc.apb2);
+        let mut gpiob = device.GPIOB.split(&mut rcc.apb2);
+
+        // Disable JTAG (Not used in Application as ST-Link V2 is avaible)
+        let (_pa15, pb3, pb4) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
 
         // Init Serial Interface over USB (STLINK)
-        let mut gpioa = device.GPIOA.split(&mut rcc.apb2);
-
         let rx_pin = gpioa.pa3.into_floating_input(&mut gpioa.crl);
         let tx_pin = gpioa.pa2.into_alternate_push_pull(&mut gpioa.crl);
 
@@ -66,6 +84,30 @@ mod app {
 
         let (mut serial_tx, mut serial_rx) = serial.split();
 
+        // Init Serial Port Steppe Pins
+        let x_step = gpioa.pa10.into_push_pull_output(&mut gpioa.crh);
+        let y_step = pb3.into_push_pull_output(&mut gpiob.crl);
+        let z_step = gpiob.pb5.into_push_pull_output(&mut gpiob.crl);
+        let x_direction = pb4.into_push_pull_output(&mut gpiob.crl);
+        let y_direction = gpiob.pb10.into_push_pull_output(&mut gpiob.crh);
+        let z_direction = gpioa.pa8.into_push_pull_output(&mut gpioa.crh);
+        let stepper_pins = hw_config::stepper::StepperPins::new(
+            x_step,
+            y_step,
+            z_step,
+            x_direction,
+            y_direction,
+            z_direction,
+        );
+
+        // Create Systic Timer
+        let mono = DwtSystick::new(
+            &mut cx.core.DCB,
+            cx.core.DWT,
+            cx.core.SYST,
+            clocks.sysclk().0,
+        );
+
         // Enable the RX Interrupt
         serial_rx.listen();
 
@@ -82,8 +124,9 @@ mod app {
                 serial_tx,
                 buffer_queue_in,
                 buffer_queue_out,
+                stepper_pins,
             },
-            init::Monotonics(),
+            init::Monotonics(mono),
         )
     }
 
@@ -100,20 +143,17 @@ mod app {
         }
     }
 
-    #[task(binds = USART2, resources = [serial_rx, buffer_queue_in])]
+    #[task(priority = 10, binds = USART2, resources = [serial_rx, buffer_queue_in])]
     fn read_serial_buffer(cx: read_serial_buffer::Context) {
         /// Serial Buffer for holding until a new line is detected
         static mut SERIAL_BUFFER: heapless::Vec<u8, 64> = heapless::Vec::new();
 
         while let Ok(data_byte) = cx.resources.serial_rx.read() {
             match data_byte {
-                b'?' => {
-                    // Status Query
-                    debug!("Status Query recived");
+                b'?' | b'~' | b'!' | 0x18 => {
+                    debug!("Realtime Command Recived");
+                    handle_realtime_command::spawn(data_byte).ok();
                 }
-                b'~' => unimplemented!(), // Start/Resume
-                b'!' => unimplemented!(), // Feed Hold
-                0x18 => cortex_m::peripheral::SCB::sys_reset(), // Soft Reset
                 0x0A => {
                     // Line Ended
                     debug!("Line End recived");
@@ -134,6 +174,13 @@ mod app {
                     SERIAL_BUFFER.push(data_byte).ok();
                 }
             };
+        }
+    }
+
+    #[task(priority = 5)]
+    fn handle_realtime_command(_: handle_realtime_command::Context, command: u8) {
+        if 0x18 == command {
+            cortex_m::peripheral::SCB::sys_reset()
         }
     }
 }
