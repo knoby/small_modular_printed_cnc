@@ -61,8 +61,8 @@ impl StepperPins {
     }
 
     pub fn end_step(&mut self) {
-        self.x_step.set_low();
-        self.y_step.set_low();
-        self.z_step.set_low();
+        self.x_step.set_low().unwrap();
+        self.y_step.set_low().unwrap();
+        self.z_step.set_low().unwrap();
     }
 }

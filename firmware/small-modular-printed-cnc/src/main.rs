@@ -9,6 +9,7 @@ use panic_probe as _;
 use rtic::app;
 
 mod arduino_shield;
+mod gcode_helper;
 mod hw_config;
 mod misc;
 
@@ -17,7 +18,6 @@ mod app {
 
     use defmt::debug;
     use dwt_systick_monotonic::DwtSystick;
-    use rtic::rtic_monotonic::{Microseconds, Seconds};
     use stm32f1xx_hal::{prelude::_stm32_hal_flash_FlashExt, rcc::RccExt};
     use stm32f1xx_hal::{prelude::*, serial::Config};
 
@@ -30,10 +30,14 @@ mod app {
         #[task_local]
         serial_rx: crate::hw_config::serial::SerialRx, // Reciving Data over Serial
         #[task_local]
-        buffer_queue_in: heapless::spsc::Producer<'static, ([u8; 64], usize), 4>,
+        buffer_serial_in: heapless::spsc::Producer<'static, ([u8; 64], usize), 4>,
         #[task_local]
-        buffer_queue_out: heapless::spsc::Consumer<'static, ([u8; 64], usize), 4>,
+        buffer_serial_out: heapless::spsc::Consumer<'static, ([u8; 64], usize), 4>,
         stepper_pins: crate::hw_config::stepper::StepperPins,
+        #[task_local]
+        buffer_gcode_in: heapless::spsc::Producer<'static, crate::gcode_helper::GCode, 8>,
+        #[task_local]
+        buffer_gcode_out: heapless::spsc::Consumer<'static, crate::gcode_helper::GCode, 8>,
     }
 
     #[monotonic(binds = SysTick, default = true)]
@@ -43,7 +47,11 @@ mod app {
     fn init(mut cx: init::Context) -> (init::LateResources, init::Monotonics) {
         static mut SERIAL_QUEUE: heapless::spsc::Queue<([u8; 64], usize), 4> =
             heapless::spsc::Queue::new();
-        let (buffer_queue_in, buffer_queue_out) = SERIAL_QUEUE.split();
+        static mut GCODE_QUEUE: heapless::spsc::Queue<crate::gcode_helper::GCode, 8> =
+            heapless::spsc::Queue::new();
+
+        let (buffer_serial_in, buffer_serial_out) = SERIAL_QUEUE.split();
+        let (buffer_gcode_in, buffer_gcode_out) = GCODE_QUEUE.split();
 
         // Get Peripherals
         let device: stm32f1xx_hal::device::Peripherals = cx.device;
@@ -122,28 +130,72 @@ mod app {
             init::LateResources {
                 serial_rx,
                 serial_tx,
-                buffer_queue_in,
-                buffer_queue_out,
+                buffer_serial_in,
+                buffer_serial_out,
                 stepper_pins,
+                buffer_gcode_in,
+                buffer_gcode_out,
             },
             init::Monotonics(mono),
         )
     }
 
-    #[idle(resources = [buffer_queue_out, serial_tx])]
+    #[idle(resources = [buffer_serial_out, buffer_gcode_in, serial_tx])]
     fn protocol_handler(cx: protocol_handler::Context) -> ! {
         loop {
-            while let Some((buffer, length)) = cx.resources.buffer_queue_out.dequeue() {
-                if buffer[0] == b'$' && length >= 2 {
-                    debug!("System Command Recived");
-                } else {
-                    debug!("G-Code Recived");
+            while let Some((buffer, length)) = cx.resources.buffer_serial_out.dequeue() {
+                if let Ok(line) = core::str::from_utf8(&buffer[..length]) {
+                    debug!("Recived Line {:?}", line);
+                    if buffer[0] == b'$' && length >= 2 {
+                        debug!("System Command Recived");
+                        use core::fmt::Write;
+                        cx.resources.serial_tx.write_str("ok\n").ok();
+                    } else {
+                        debug!("G-Code Recived");
+                        use core::fmt::Write;
+                        cx.resources.serial_tx.write_str("ok\n").ok();
+                        let g_code_parser: gcode::Parser<gcode::Nop, crate::gcode_helper::Buffer> =
+                            gcode::Parser::new(line, gcode::Nop);
+                        for line in g_code_parser {
+                            for gcode in line.gcodes() {
+                                cx.resources.buffer_gcode_in.enqueue(gcode.clone()).ok();
+                            }
+                        }
+                        // Start processing of gcodes
+                        gcode_interpreter::spawn().ok();
+                    }
                 }
             }
         }
     }
 
-    #[task(priority = 10, binds = USART2, resources = [serial_rx, buffer_queue_in])]
+    #[task(priority = 5, resources = [buffer_gcode_out])]
+    fn gcode_interpreter(cx: gcode_interpreter::Context) {
+        let buffer: &mut heapless::spsc::Consumer<'static, crate::gcode_helper::GCode, 8> =
+            cx.resources.buffer_gcode_out;
+
+        while let Some(gcode) = buffer.dequeue() {
+            match gcode.mnemonic() {
+                gcode::Mnemonic::General => {
+                    debug!("G")
+                }
+                gcode::Mnemonic::Miscellaneous => {
+                    debug!("M")
+                }
+                gcode::Mnemonic::ProgramNumber => {
+                    debug!("P")
+                }
+                gcode::Mnemonic::ToolChange => {
+                    debug!("T")
+                }
+            }
+            for arg in gcode.arguments().iter().map(|arg| arg.letter) {
+                debug!("Argument {:?}", arg);
+            }
+        }
+    }
+
+    #[task(priority = 10, binds = USART2, resources = [serial_rx, buffer_serial_in])]
     fn read_serial_buffer(cx: read_serial_buffer::Context) {
         /// Serial Buffer for holding until a new line is detected
         static mut SERIAL_BUFFER: heapless::Vec<u8, 64> = heapless::Vec::new();
@@ -163,7 +215,7 @@ mod app {
                             *place = *data;
                         }
                         cx.resources
-                            .buffer_queue_in
+                            .buffer_serial_in
                             .enqueue((data, SERIAL_BUFFER.len()))
                             .ok();
                         SERIAL_BUFFER.clear();
