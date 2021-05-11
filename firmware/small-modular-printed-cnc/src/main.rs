@@ -12,12 +12,14 @@ mod arduino_shield;
 mod gcode_helper;
 mod hw_config;
 mod misc;
+mod ramp_gen;
 
-#[app(device = stm32f1xx_hal::device, dispatchers = [SPI1, SPI2])]
+#[app(device = stm32f1xx_hal::device, dispatchers = [SPI1, SPI2, DMA1_CHANNEL1, DMA1_CHANNEL2, DMA1_CHANNEL3])]
 mod app {
 
     use defmt::debug;
     use dwt_systick_monotonic::DwtSystick;
+    use rtic::rtic_monotonic::{Microseconds, Milliseconds, Nanoseconds};
     use stm32f1xx_hal::{prelude::_stm32_hal_flash_FlashExt, rcc::RccExt};
     use stm32f1xx_hal::{prelude::*, serial::Config};
 
@@ -38,10 +40,11 @@ mod app {
         buffer_gcode_in: heapless::spsc::Producer<'static, crate::gcode_helper::GCode, 8>,
         #[task_local]
         buffer_gcode_out: heapless::spsc::Consumer<'static, crate::gcode_helper::GCode, 8>,
+        ramp_gen: crate::ramp_gen::RampGenerator,
     }
 
     #[monotonic(binds = SysTick, default = true)]
-    type MyMono = DwtSystick<64_000_000>; // 64 MHz
+    type MyMono = DwtSystick<32_000_000>; // 64 MHz
 
     #[init]
     fn init(mut cx: init::Context) -> (init::LateResources, init::Monotonics) {
@@ -62,9 +65,9 @@ mod app {
 
         let clocks = rcc
             .cfgr
-            .sysclk(64.mhz())
-            .pclk1(32.mhz())
-            .pclk2(64.mhz())
+            .sysclk(32.mhz())
+            .pclk1(16.mhz())
+            .pclk2(32.mhz())
             .freeze(&mut flash.acr);
 
         // Activate GPIOs
@@ -72,7 +75,7 @@ mod app {
         let mut gpiob = device.GPIOB.split(&mut rcc.apb2);
 
         // Disable JTAG (Not used in Application as ST-Link V2 is avaible)
-        let (_pa15, pb3, pb4) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
+        //let (_pa15, pb3, pb4) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
 
         // Init Serial Interface over USB (STLINK)
         let rx_pin = gpioa.pa3.into_floating_input(&mut gpioa.crl);
@@ -93,19 +96,21 @@ mod app {
         let (mut serial_tx, mut serial_rx) = serial.split();
 
         // Init Serial Port Steppe Pins
-        let x_step = gpioa.pa10.into_push_pull_output(&mut gpioa.crh);
-        let y_step = pb3.into_push_pull_output(&mut gpiob.crl);
+        let x_step = gpioa.pa6.into_push_pull_output(&mut gpioa.crl);
+        let y_step = gpioa.pa5.into_push_pull_output(&mut gpioa.crl);
         let z_step = gpiob.pb5.into_push_pull_output(&mut gpiob.crl);
-        let x_direction = pb4.into_push_pull_output(&mut gpiob.crl);
+        let x_direction = gpiob.pb9.into_push_pull_output(&mut gpiob.crh);
         let y_direction = gpiob.pb10.into_push_pull_output(&mut gpiob.crh);
         let z_direction = gpioa.pa8.into_push_pull_output(&mut gpioa.crh);
-        let stepper_pins = hw_config::stepper::StepperPins::new(
+        let enable = gpioa.pa9.into_push_pull_output(&mut gpioa.crh);
+        let mut stepper_pins = hw_config::stepper::StepperPins::new(
             x_step,
             y_step,
             z_step,
             x_direction,
             y_direction,
             z_direction,
+            enable,
         );
 
         // Create Systic Timer
@@ -119,12 +124,21 @@ mod app {
         // Enable the RX Interrupt
         serial_rx.listen();
 
+        // Create Profile Generator
+        let mut ramp_gen = crate::ramp_gen::RampGenerator::default();
+        ramp_gen.set_acceleration(32_000.0);
+        ramp_gen.set_max_speed(8_000.0);
+        ramp_gen.set_target(1_600, 0.0);
+        stepper_pins.enable();
+
         // Send Welcome Message
         use core::fmt::Write;
         serial_tx.write_str("SMPCNC Version ").ok();
         serial_tx.write_str(crate::VERSION).ok();
         nb::block!(serial_tx.write(b'\n')).ok();
         serial_tx.write_str("Grbl 1.1h ['$' for help]\n").ok();
+
+        step_calc::spawn_after(Milliseconds(500_u32)).ok();
 
         (
             init::LateResources {
@@ -135,6 +149,7 @@ mod app {
                 stepper_pins,
                 buffer_gcode_in,
                 buffer_gcode_out,
+                ramp_gen,
             },
             init::Monotonics(mono),
         )
@@ -227,6 +242,53 @@ mod app {
                 }
             };
         }
+    }
+
+    #[task(priority = 14,  resources = [ramp_gen])]
+    fn step_calc(mut cx: step_calc::Context) {
+        static mut NEXT_STEP_TIME: u32 = 0;
+
+        if *NEXT_STEP_TIME == 0 {
+            // No more step
+            step_calc::spawn_after(Milliseconds(100_u32)).unwrap();
+        } else {
+            // Do a step
+            start_step_pulse::spawn(
+                cx.resources
+                    .ramp_gen
+                    .lock(|ramp_gen| ramp_gen.get_current_dir()),
+                crate::ramp_gen::Direction::StandStill,
+                crate::ramp_gen::Direction::StandStill,
+            )
+            .unwrap();
+            step_calc::spawn_after(Nanoseconds(*NEXT_STEP_TIME)).unwrap();
+            end_step_pulse::spawn_after(Microseconds(10_u32)).unwrap();
+        }
+
+        // Calculate the next step time from profile generator
+        *NEXT_STEP_TIME = cx
+            .resources
+            .ramp_gen
+            .lock(|ramp_gen| ramp_gen.get_next_step()) as u32;
+    }
+
+    #[task(priority = 15, resources = [stepper_pins])]
+    fn start_step_pulse(
+        mut cx: start_step_pulse::Context,
+        x: crate::ramp_gen::Direction,
+        y: crate::ramp_gen::Direction,
+        z: crate::ramp_gen::Direction,
+    ) {
+        cx.resources.stepper_pins.lock(|pins| {
+            pins.start_step(x, y, z);
+        })
+    }
+
+    #[task(priority = 15, resources = [stepper_pins])]
+    fn end_step_pulse(mut cx: end_step_pulse::Context) {
+        cx.resources.stepper_pins.lock(|pins| {
+            pins.end_step();
+        });
     }
 
     #[task(priority = 5)]
