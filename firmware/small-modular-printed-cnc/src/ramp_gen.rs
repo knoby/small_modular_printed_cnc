@@ -189,11 +189,6 @@ impl RampGenerator {
         self.current_speed = speed;
     }
 
-    /// Get the current moving direction
-    pub fn get_current_dir(&self) -> Direction {
-        self.direction
-    }
-
     /// Sets the targetparameter for the profile generation
     /// Caution:
     /// If the target speed is internaly limited to the max. speed.
@@ -241,9 +236,9 @@ impl RampGenerator {
         self.step_interval
     }
 
-    /// Gets the current position of the profile Stepper
-    pub fn get_current_pos(&self) -> i64 {
-        self.current_position
+    /// Sets the current position
+    pub fn set_current_pos(&mut self, current_pos: i64) {
+        self.current_position = current_pos;
     }
 
     pub fn set_acceleration(&mut self, acceleration: f32) {

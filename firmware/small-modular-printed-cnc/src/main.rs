@@ -12,6 +12,7 @@ mod arduino_shield;
 mod gcode_helper;
 mod hw_config;
 mod misc;
+mod motionkernel;
 mod ramp_gen;
 
 #[app(device = stm32f1xx_hal::device, dispatchers = [SPI1, SPI2, DMA1_CHANNEL1, DMA1_CHANNEL2, DMA1_CHANNEL3])]
@@ -19,14 +20,18 @@ mod app {
 
     use defmt::debug;
     use dwt_systick_monotonic::DwtSystick;
-    use rtic::rtic_monotonic::{Microseconds, Milliseconds, Nanoseconds};
+    use rtic::rtic_monotonic::{Milliseconds, Nanoseconds};
     use stm32f1xx_hal::{prelude::_stm32_hal_flash_FlashExt, rcc::RccExt};
     use stm32f1xx_hal::{prelude::*, serial::Config};
 
-    use crate::hw_config;
+    use crate::{
+        hw_config,
+        motionkernel::{Acceleration, MotionSettings, Position, Velocity},
+        ramp_gen::Direction,
+    };
 
     #[resources]
-    struct Resources {
+    struct Resources<S: crate::motionkernel::MotionState> {
         #[task_local]
         serial_tx: crate::hw_config::serial::SerialTx, // Sending Data over Serial
         #[task_local]
@@ -35,12 +40,13 @@ mod app {
         buffer_serial_in: heapless::spsc::Producer<'static, ([u8; 64], usize), 4>,
         #[task_local]
         buffer_serial_out: heapless::spsc::Consumer<'static, ([u8; 64], usize), 4>,
-        stepper_pins: crate::hw_config::stepper::StepperPins,
         #[task_local]
         buffer_gcode_in: heapless::spsc::Producer<'static, crate::gcode_helper::GCode, 8>,
         #[task_local]
         buffer_gcode_out: heapless::spsc::Consumer<'static, crate::gcode_helper::GCode, 8>,
-        ramp_gen: crate::ramp_gen::RampGenerator,
+        stepper: crate::hw_config::stepper::StepperPins,
+        #[task_local]
+        motion_kernel: crate::motionkernel::MotionKernel,
     }
 
     #[monotonic(binds = SysTick, default = true)]
@@ -75,7 +81,7 @@ mod app {
         let mut gpiob = device.GPIOB.split(&mut rcc.apb2);
 
         // Disable JTAG (Not used in Application as ST-Link V2 is avaible)
-        //let (_pa15, pb3, pb4) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
+        let (_pa15, _pb3, _pb4) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
 
         // Init Serial Interface over USB (STLINK)
         let rx_pin = gpioa.pa3.into_floating_input(&mut gpioa.crl);
@@ -103,7 +109,7 @@ mod app {
         let y_direction = gpiob.pb10.into_push_pull_output(&mut gpiob.crh);
         let z_direction = gpioa.pa8.into_push_pull_output(&mut gpioa.crh);
         let enable = gpioa.pa9.into_push_pull_output(&mut gpioa.crh);
-        let mut stepper_pins = hw_config::stepper::StepperPins::new(
+        let stepper = hw_config::stepper::StepperPins::new(
             x_step,
             y_step,
             z_step,
@@ -124,12 +130,17 @@ mod app {
         // Enable the RX Interrupt
         serial_rx.listen();
 
-        // Create Profile Generator
-        let mut ramp_gen = crate::ramp_gen::RampGenerator::default();
-        ramp_gen.set_acceleration(32_000.0);
-        ramp_gen.set_max_speed(8_000.0);
-        ramp_gen.set_target(1_600, 0.0);
-        stepper_pins.enable();
+        // Create Motion Kernel
+        let settings = MotionSettings {
+            max_vel: Velocity::new(20.0, 20.0, 10.0),
+            max_acc: Acceleration::new(50.0, 50.0, 50.0),
+            max_path_vel: 20.0,
+            max_path_acc: 50.0,
+        };
+        let mut motion_kernel = crate::motionkernel::MotionKernel::new(settings);
+        motion_kernel.move_to(Position::new(50, 40, 10));
+
+        calc_step::spawn().unwrap();
 
         // Send Welcome Message
         use core::fmt::Write;
@@ -138,18 +149,16 @@ mod app {
         nb::block!(serial_tx.write(b'\n')).ok();
         serial_tx.write_str("Grbl 1.1h ['$' for help]\n").ok();
 
-        step_calc::spawn_after(Milliseconds(500_u32)).ok();
-
         (
             init::LateResources {
-                serial_rx,
-                serial_tx,
-                buffer_serial_in,
-                buffer_serial_out,
-                stepper_pins,
                 buffer_gcode_in,
                 buffer_gcode_out,
-                ramp_gen,
+                buffer_serial_in,
+                buffer_serial_out,
+                motion_kernel,
+                serial_rx,
+                serial_tx,
+                stepper,
             },
             init::Monotonics(mono),
         )
@@ -210,6 +219,48 @@ mod app {
         }
     }
 
+    #[task(priority = 10, resources = [ motion_kernel])]
+    fn calc_step(cx: calc_step::Context) {
+        static mut NEXT_STEPSIZE: u32 = 0;
+        static mut NEXT_STEP: (Direction, Direction, Direction) = (
+            Direction::StandStill,
+            Direction::StandStill,
+            Direction::StandStill,
+        );
+
+        // Schedule next step
+        calc_step::spawn_after(Nanoseconds(*NEXT_STEPSIZE)).unwrap();
+        // Do current step
+        if *NEXT_STEPSIZE != 0 {
+            step_up::spawn(*NEXT_STEP).unwrap();
+            step_down::spawn_after(Milliseconds(10_u32)).unwrap();
+        }
+        let (step, size) = cx.resources.motion_kernel.calc_next_step();
+
+        *NEXT_STEPSIZE = size as u32;
+        *NEXT_STEP = step;
+    }
+
+    #[task(priority = 15, resources = [stepper])]
+    fn step_up(
+        mut cx: step_up::Context,
+        step: (
+            crate::ramp_gen::Direction,
+            crate::ramp_gen::Direction,
+            crate::ramp_gen::Direction,
+        ),
+    ) {
+        let (x, y, z) = step;
+        cx.resources
+            .stepper
+            .lock(|stepper| stepper.start_step(x, y, z));
+    }
+
+    #[task(priority = 15, resources = [stepper])]
+    fn step_down(mut cx: step_down::Context) {
+        cx.resources.stepper.lock(|stepper| stepper.end_step());
+    }
+
     #[task(priority = 10, binds = USART2, resources = [serial_rx, buffer_serial_in])]
     fn read_serial_buffer(cx: read_serial_buffer::Context) {
         /// Serial Buffer for holding until a new line is detected
@@ -242,53 +293,6 @@ mod app {
                 }
             };
         }
-    }
-
-    #[task(priority = 14,  resources = [ramp_gen])]
-    fn step_calc(mut cx: step_calc::Context) {
-        static mut NEXT_STEP_TIME: u32 = 0;
-
-        if *NEXT_STEP_TIME == 0 {
-            // No more step
-            step_calc::spawn_after(Milliseconds(100_u32)).unwrap();
-        } else {
-            // Do a step
-            start_step_pulse::spawn(
-                cx.resources
-                    .ramp_gen
-                    .lock(|ramp_gen| ramp_gen.get_current_dir()),
-                crate::ramp_gen::Direction::StandStill,
-                crate::ramp_gen::Direction::StandStill,
-            )
-            .unwrap();
-            step_calc::spawn_after(Nanoseconds(*NEXT_STEP_TIME)).unwrap();
-            end_step_pulse::spawn_after(Microseconds(10_u32)).unwrap();
-        }
-
-        // Calculate the next step time from profile generator
-        *NEXT_STEP_TIME = cx
-            .resources
-            .ramp_gen
-            .lock(|ramp_gen| ramp_gen.get_next_step()) as u32;
-    }
-
-    #[task(priority = 15, resources = [stepper_pins])]
-    fn start_step_pulse(
-        mut cx: start_step_pulse::Context,
-        x: crate::ramp_gen::Direction,
-        y: crate::ramp_gen::Direction,
-        z: crate::ramp_gen::Direction,
-    ) {
-        cx.resources.stepper_pins.lock(|pins| {
-            pins.start_step(x, y, z);
-        })
-    }
-
-    #[task(priority = 15, resources = [stepper_pins])]
-    fn end_step_pulse(mut cx: end_step_pulse::Context) {
-        cx.resources.stepper_pins.lock(|pins| {
-            pins.end_step();
-        });
     }
 
     #[task(priority = 5)]
